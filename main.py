@@ -5,13 +5,20 @@ import logging
 
 import numpy as np
 
-from fastapi import FastAPI, UploadFile, Form
+from fastapi import FastAPI, UploadFile, Form, File
 from fastapi.responses import JSONResponse
 
-from processing.audio_merger import group_audiobook_files_by_directory, concatenate_audio_files
-from processing.extract_audio_features import extract_audio_features, extract_features_from_directory, parallel_audio_extraction
-from processing.extract_text_embeddings import extract_text_embeddings
 from ingestion.metadata_handler import add_metadata
+
+from processing.extract_audio_features import (
+    extract_audio_features, 
+    extract_features_from_directory_parallel
+)
+from processing.inference import perform_inference
+from processing.transcribe_audiobook import transcribe_audio
+from processing.extract_text_embeddings import combine_text_features_batch
+from processing.audio_merger import group_audiobook_files_by_directory, concatenate_audio_files
+
 from models.unsupervised_clustering import combine_features, perform_clustering, visualize_clusters
 
 app = FastAPI()
@@ -20,11 +27,8 @@ app = FastAPI()
 
 BASE_DIRECTORY = "./audiobooks"
 METADATA_PATH = "metadata.json"
-model_save_path = "./models/trained_models/kmeans_model.pkl"
-
-audio_dir = "./audiobooks"
-model_save_path = "./models/kmeans_model.pkl"
-metadata_path = "./metadata.json"
+MODEL_SAVE_PATH = "./models/trained_models/kmeans_model.pkl"
+MODEL_VISUALIZATION_PATH = "/models/trained_model_clusters/cluster_visualization.png"
 
 os.makedirs(BASE_DIRECTORY, exist_ok=True)
 
@@ -117,137 +121,134 @@ async def train_model(batch_size: int = 100):
     """
 
     try:
-        # Step 1: Extract audio features in batches
+        # Step 1: Load metadata file (needs to be generated at this point already) and collect all
+        # bookid_combined.mp3 files into a list
         audio_features = {}
         audio_files = []
+        all_combined_text_embeddings = []
 
-        logging.info("Preparing the audio directory")
-        for root, _, files in os.walk(audio_dir):
+        if not os.path.exists(METADATA_PATH):
+            return {"error": "Metadata file not found. Please ensure metadata.json exists."}
+
+        with open(METADATA_PATH, "r") as f:
+            metadata = json.load(f)
+        
+        metadata_dict = {entry["id"]: entry for entry in metadata}
+        logging.info(f"Loaded metadata for {len(metadata_dict)} audiobooks.")
+
+        for root, _, files in os.walk(BASE_DIRECTORY):
             for file in files:
                 if file.endswith("_combined.mp3"):
-                    audio_files.append(os.path.join(root, file))
-
-        for i in range(0, len(audio_files), batch_size):
-            batch = audio_files[i: i + batch_size]
-            logging.info(f"Processing audio batch {i // batch_size + 1}/{(len(audio_files) + batch_size - 1) // batch_size}")
-            batch_features = parallel_audio_extraction(batch)
-            audio_features.update(batch_features)
+                    file_id = os.path.basename(root)  # Assuming parent folder name is the audiobook ID
+                    audio_path = os.path.join(root, file)
+                    audio_files.append({"id": file_id, "path": audio_path})
 
         if not audio_files:
             return {"error": "No audio features extracted. Check your audio files."}
+
+        logging.info(f"Discovered {len(audio_files)} combined audio files.")
+
+        # Step 2: Extract audio features from all audiobooks within the directory
+        audio_paths = [file["path"] for file in audio_files]
+        audio_features_dict = extract_features_from_directory_parallel(audio_paths) 
+        audio_features = {
+            file["id"]: audio_features_dict[file["path"]] for file in audio_files if file["path"] in audio_features_dict
+        }
+
+        # Step 3: Loop through the files batch-wise, transcribing audio files, pulling audiobook descriptions
+        # and preparing the text embeddings
+        for i in range(0, len(audio_files), batch_size):
+            batch = audio_files[i: i + batch_size]
+            logging.info(f"Processing audio batch {i // batch_size + 1}/{(len(audio_files) + batch_size - 1) // batch_size}")
+            
+            batch_descriptions = [file["description"] for file in batch]
+            batch_transcriptions = []
+
+            for file in batch:
+                transcription = transcribe_audio(file["path"])
+                batch_transcriptions.append(transcription)
+
+            combined_text_embeddings = combine_text_features_batch(batch_descriptions, batch_transcriptions)
+            all_combined_text_embeddings.extend(combined_text_embeddings)
+
+        if not all_combined_text_embeddings:
+            return {
+                "error": "Error in combining audio/text embeddings extracted. Check your metadata, audio transcriptions, and audio feature extraction."
+            }
         
-        logging.info(f"Extracted features for {len(audio_features)} audio files.")
+        # Step 4: combine all text and audio embeddings
+        logging.info("Combining all audio and text features for training...")
+        audio_feature_matrix = np.array(list(audio_features.values()))
+        text_feature_matrix = np.vstack(all_combined_text_embeddings)
+        combined_features = np.hstack([audio_feature_matrix, text_feature_matrix])
 
-        # Step 2: Extract text embeddings in batches
-        all_text_embeddings = []
-        logging.info("Extracting text embeddings in batches...")
-
-        if not os.path.exists(metadata_path):
-            return {"error": "Metadata file not found. Please ensure metadata.json exists."}
-
-        with open(metadata_path, "r") as f:
-            metadata = json.load(f)
-        
-        descriptions = [entry["description"] for entry in metadata if f"{entry['id']}_combined.mp3" in audio_features]
-        
-        for i in range(0, len(descriptions), batch_size):
-            batch = descriptions[i:i + batch_size]
-            logging.info(f"Processing text embedding batch {i // batch_size + 1}/{(len(descriptions) + batch_size - 1) // batch_size}")
-            text_embeddings = extract_text_embeddings(batch)
-            all_text_embeddings.extend(text_embeddings)
-
-        if not all_text_embeddings:
-            return {"error": "No text embeddings extracted. Check your metadata descriptions."}
-        
-        logging.info(f"Extracted text embeddings for {len(all_text_embeddings)} descriptions.")
-
-         # Step 3: Combine features
-        logging.info("Combining audio and text features...")
-        combined_features = combine_features(
-            audio_features, np.vstack(all_text_embeddings), list(audio_features.keys())
-        )
-
-        # Step 4: Perform clustering
+        # Step 5: Train clustering model
         logging.info("Performing clustering...")
-        labels = perform_clustering(combined_features, num_clusters=5)
+        labels = perform_clustering(combined_features)
 
-        # Step 5: Visualize clusters
-        visualization_path = "/models/trained_model_clusters/cluster_visualization.png"
-        visualize_clusters(combined_features, labels, save_path=visualization_path)
+        # Step 6: Visualize clusters
+        visualize_clusters(combined_features, labels, save_path=MODEL_VISUALIZATION_PATH)
+        joblib.dump({"model": labels}, MODEL_SAVE_PATH)
 
-        # Step 6: Save clustering model
-        joblib.dump({"model": labels}, model_save_path)
         return {
-            "message": "Training complete", 
-            "model_save_path": model_save_path,
-            "visualization_path": visualization_path
+                "message": "Training complete", 
+                "model_save_path": MODEL_SAVE_PATH,
+                "visualization_path": MODEL_VISUALIZATION_PATH
         }
     
     except Exception as e:
         logging.error(f"Error during training: {e}")
         return {"error": str(e)}
-
-@app.post("/predict_genre")
-async def predict_genre(filenames: list[str] = Form(None)):
+    
+@app.post("/predict")
+async def predict_genre(
+    file: UploadFile = File(...), 
+    description: str = Form(...)
+):
     """
-    Endpoint to predict the genre cluster for combined audiobook files.
+    Predicts the genre of a new audiobook by dynamically extracting audio and text features.
 
     Args:
-        filenames (list[str]): Optional list of audiobook directory names. If None, process all combined files.
+        file (UploadFile): Uploaded audiobook file.
+        description (str): Optional description of the audiobook.
 
     Returns:
-        dict: Predicted cluster labels.
+        dict: Predicted genre or cluster label.
     """
 
     try:
-        # Step 1: Load the saved clustering model
-        if not os.path.exists(model_save_path):
-            return {"error": "Model not trained yet. Please call /train_model first."}
+        # Save the uploaded file to a temporary location
+        temp_audio_path = f"temp_{file.filename}"
+        with open(temp_audio_path, "wb") as f:
+            f.write(file.file.read())
 
-        saved_model = joblib.load(model_save_path)
-        kmeans_model = saved_model["model"]
+        # Step 1: Extract audio features
+        logging.info("Extracting audio features...")
+        audio_features = extract_audio_features(temp_audio_path)
 
-        # Step 2: Load metadata
-        if not os.path.exists(metadata_path):
-            return {"error": "Metadata file not found. Please ensure metadata.json exists."}
+        # Step 2: Transcribe the audiobook
+        logging.info("Transcribing the audiobook...")
+        transcription = transcribe_audio(temp_audio_path)
 
-        with open(metadata_path, "r") as f:
-            metadata = json.load(f)
+        # Step 3: Combine text features (transcription + description)
+        combined_text_features = combine_text_features_batch([description], [transcription])[0]
 
-        # Step 3: Determine which files to process
-        if filenames:
-            matched_metadata = [entry for entry in metadata if entry["id"] in filenames]
-            if not matched_metadata:
-                return {"error": "No matching metadata found for the provided filenames."}
+        # Step 4: Combine audio and text features
+        combined_features = np.hstack([audio_features, combined_text_features])
 
-            descriptions = [entry["description"] for entry in matched_metadata]
-            combined_audio_files = [
-                os.path.join(audio_dir, filename, f"{filename}_combined.mp3") for filename in filenames
-            ]
-            for file in combined_audio_files:
-                if not os.path.exists(file):
-                    return {"error": f"Audio file not found: {file}"}
+        # Step 5: Perform inference
+        logging.info("Performing inference...")
+        predicted_label = perform_inference(combined_features)
 
-            audio_features = {
-                filename: extract_audio_features(file)
-                for filename, file in zip(filenames, combined_audio_files)
-            }
-        else:
-            # Process all '_combined.mp3' files dynamically
-            audio_features = extract_features_from_directory(audio_dir)
-            descriptions = [
-                entry["description"] for entry in metadata if f"{entry['id']}_combined.mp3" in audio_features
-            ]
+        # Clean up temporary audio file
+        os.remove(temp_audio_path)
 
-        # Step 4: Extract text embeddings
-        text_embeddings = extract_text_embeddings(descriptions)
-
-        # Step 5: Combine features
-        combined_features = combine_features(audio_features, text_embeddings, list(audio_features.keys()))
-
-        # Step 6: Predict cluster labels
-        cluster_labels = kmeans_model.predict(combined_features)
-        return {"predicted_clusters": {filename: label for filename, label in zip(audio_features.keys(), cluster_labels)}}
+        return {
+            "predicted_label": predicted_label,
+            "description_used": description if description else "No description provided",
+            "transcription_used": transcription[:200]  # Return a snippet of the transcription
+        }
 
     except Exception as e:
-        return {"error": str(e)}
+        logging.error(f"Error during prediction: {e}")
+        return {"error": f"Prediction failed: {str(e)}"}
